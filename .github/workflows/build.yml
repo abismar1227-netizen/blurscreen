@@ -1,0 +1,50 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  mac:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build universal binary
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create -output blurscreen-universal \
+            target/aarch64-apple-darwin/release/blurscreen \
+            target/x86_64-apple-darwin/release/blurscreen
+      - name: Make app bundle and zip
+        run: |
+          bash packaging/make_app.sh blurscreen-universal
+          cp packaging/readme-mac.txt dist/README.txt
+          cd dist && zip -ry ../BlurScreen-mac.zip BlurScreen.app README.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlurScreen-mac
+          path: BlurScreen-mac.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/blurscreen.exe dist/BlurScreen.exe
+          Copy-Item packaging/readme-windows.txt dist/README.txt
+          Compress-Archive -Path dist/* -DestinationPath BlurScreen-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlurScreen-windows
+          path: BlurScreen-windows.zip
