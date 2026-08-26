@@ -714,7 +714,29 @@ impl ApplicationHandler<()> for App {
     }
 }
 
+/// macOS App Nap 방지.
+/// 블러 창은 보통 다른 창 뒤에 가려진 채 오래 동작하는데, macOS는 그런 앱을
+/// "한가하다"고 판단해 App Nap(절전 격하) 대상으로 삼을 수 있다. 절전 격하가
+/// 일어나면 창 갱신·캡처 전달이 지연되어 디스코드의 창 캡처 세션이 장시간 공유
+/// 중 끊어지는 원인이 될 수 있으므로, 시스템에 "사용자 주도 작업 중"임을 선언해
+/// 앱이 실행되는 동안 App Nap을 차단한다.
+#[cfg(target_os = "macos")]
+fn prevent_app_nap() {
+    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+    let info = NSProcessInfo::processInfo();
+    let reason = NSString::from_str("Live screen blur for screen sharing");
+    let activity = unsafe {
+        info.beginActivityWithOptions_reason(NSActivityOptions::NSActivityUserInitiated, &reason)
+    };
+    // 활동 토큰을 앱 종료 시까지 유지 (해제하면 App Nap 차단이 풀림)
+    std::mem::forget(activity);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prevent_app_nap() {}
+
 fn main() {
+    prevent_app_nap();
     let shared = Arc::new(Shared::new());
     load_config(&shared);
 
