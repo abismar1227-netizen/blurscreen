@@ -32,11 +32,28 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
-        run: cargo build --release
+        shell: pwsh
+        run: |
+          $out = cargo build --release 2>&1 | ForEach-Object { $_.ToString() }
+          $code = $LASTEXITCODE
+          $out | Out-File -FilePath build-log-windows.txt -Encoding utf8
+          $out | Select-Object -Last 120 | Out-File -FilePath build-tail-windows.txt -Encoding utf8
+          exit $code
+      - name: Save error log to repository
+        if: failure()
+        shell: pwsh
+        run: |
+          git config user.name "build-bot"
+          git config user.email "build-bot@users.noreply.github.com"
+          git add -f build-log-windows.txt build-tail-windows.txt
+          git commit -m "ci: windows build error log [skip ci]"
+          git push
       - name: Package
         shell: pwsh
         run: |
