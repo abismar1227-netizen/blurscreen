@@ -322,51 +322,19 @@ fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<()>) {
             return;
         }
 
-        // 대상 디스플레이와 제외 창 목록 구성
-        let targets = catch_unwind(scap::get_all_targets).unwrap_or_default();
-        let displays: Vec<Target> = targets
-            .iter()
-            .filter(|t| matches!(t, Target::Display(_)))
-            .cloned()
-            .collect();
-        if displays.is_empty() {
-            set_status("캡처할 디스플레이를 찾지 못했습니다 — 재시도 중");
-            thread::sleep(Duration::from_secs(1));
-            continue;
-        }
-        shared.display_count.store(displays.len(), Ordering::Relaxed);
-        let di = shared.display_idx.load(Ordering::Relaxed) % displays.len();
-
-        // 자기 자신(블러 창)은 캡처에서 제외 → 거울 속 거울 방지 (macOS에서 동작)
-        let excluded: Vec<Target> = targets
-            .iter()
-            .filter(|t| matches!(t, Target::Window(w) if w.title.starts_with(WINDOW_TITLE)))
-            .cloned()
-            .collect();
-
-        let fps = FPS_OPTIONS[shared.fps_idx.load(Ordering::Relaxed) % FPS_OPTIONS.len()];
-        let options = Options {
-            fps,
-            show_cursor: true,
-            show_highlight: false,
-            target: Some(displays[di].clone()),
-            crop_area: None,
-            output_type: FrameType::BGRAFrame,
-            // 캡처 단계에서 이미 640px 급으로 GPU 축소 → 이후 연산이 전부 가벼워짐
-            output_resolution: Resolution::_480p,
-            excluded_targets: if excluded.is_empty() { None } else { Some(excluded) },
-        };
-
         // ---- 펌프 스레드 시작 ----
         // get_next_frame()은 스트림이 조용히 죽으면 영원히 잠들 수 있다.
         // 그래서 프레임 대기는 '희생 가능한' 펌프 스레드에 맡기고,
         // 이 관제 루프는 타임아웃 있는 수신으로 워치독 역할을 겸한다.
+        //
+        // 캡처 대상(Target)은 Windows에서 스레드 간 이동이 불가능한 원시 핸들을
+        // 담고 있어서, 옵션 구성은 여기서 하지 않고 펌프 스레드 안에서 한다.
         let gen = shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         {
             let ftx = ftx.clone();
             let shared = shared.clone();
-            thread::spawn(move || pump_frames(gen, options, ftx, ready_tx, shared));
+            thread::spawn(move || pump_frames(gen, ftx, ready_tx, shared));
         }
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(())) => set_status(""),
@@ -383,6 +351,7 @@ fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<()>) {
         }
 
         // 캡처 엔진이 fps 제한을 지원하지 않는 플랫폼(Windows) 대비, 앱 레벨 스로틀 간격.
+        let fps = FPS_OPTIONS[shared.fps_idx.load(Ordering::Relaxed) % FPS_OPTIONS.len()];
         let min_gap = Duration::from_millis((800 / fps.max(1)) as u64);
         let mut last_hash: u64 = 0;
         let mut last_proc: Option<Instant> = None;
@@ -442,16 +411,48 @@ fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<()>) {
     }
 }
 
-/// 펌프 스레드: 캡처 스트림을 만들고 프레임을 관제 루프로 퍼 올린다.
+/// 펌프 스레드: 캡처 대상을 고르고 스트림을 만들어 프레임을 관제 루프로 퍼 올린다.
 /// get_next_frame()이 영원히 잠들 수 있으므로 이 스레드는 희생 가능하게 설계했다 —
 /// 자신의 세대가 지나면 다음 프레임 수신 시 스트림을 정리하고 스스로 종료한다.
 fn pump_frames(
     gen: u64,
-    options: Options,
     ftx: mpsc::Sender<(u64, Frame)>,
     ready_tx: mpsc::Sender<Result<(), String>>,
     shared: Arc<Shared>,
 ) {
+    // 대상 디스플레이와 제외 창 목록 구성 (Target은 이 스레드 밖으로 내보내지 않는다)
+    let targets = catch_unwind(scap::get_all_targets).unwrap_or_default();
+    let displays: Vec<Target> = targets
+        .iter()
+        .filter(|t| matches!(t, Target::Display(_)))
+        .cloned()
+        .collect();
+    if displays.is_empty() {
+        let _ = ready_tx.send(Err("캡처할 디스플레이를 찾지 못했습니다".to_string()));
+        return;
+    }
+    shared.display_count.store(displays.len(), Ordering::Relaxed);
+    let di = shared.display_idx.load(Ordering::Relaxed) % displays.len();
+
+    // 자기 자신(블러 창)은 캡처에서 제외 → 거울 속 거울 방지 (macOS에서 동작)
+    let excluded: Vec<Target> = targets
+        .iter()
+        .filter(|t| matches!(t, Target::Window(w) if w.title.starts_with(WINDOW_TITLE)))
+        .cloned()
+        .collect();
+
+    let options = Options {
+        fps: FPS_OPTIONS[shared.fps_idx.load(Ordering::Relaxed) % FPS_OPTIONS.len()],
+        show_cursor: true,
+        show_highlight: false,
+        target: Some(displays[di].clone()),
+        crop_area: None,
+        output_type: FrameType::BGRAFrame,
+        // 캡처 단계에서 이미 640px 급으로 GPU 축소 → 이후 연산이 전부 가벼워짐
+        output_resolution: Resolution::_480p,
+        excluded_targets: if excluded.is_empty() { None } else { Some(excluded) },
+    };
+
     let mut capturer = match catch_unwind(AssertUnwindSafe(|| Capturer::build(options))) {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
