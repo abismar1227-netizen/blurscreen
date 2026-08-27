@@ -17,10 +17,10 @@
 use std::num::NonZeroU32;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use scap::capturer::{Capturer, Options, Resolution};
 use scap::frame::{Frame, FrameType};
@@ -64,6 +64,8 @@ struct Shared {
     /// fps/모니터 변경 시 캡처 스트림 재구성 요청
     rebuild: AtomicBool,
     quit: AtomicBool,
+    /// 현재 유효한 캡처 세대 번호 — 구세대 펌프 스레드가 스스로 종료하는 기준
+    generation: AtomicU64,
 }
 
 impl Shared {
@@ -78,6 +80,7 @@ impl Shared {
             paused: AtomicBool::new(false),
             rebuild: AtomicBool::new(false),
             quit: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
         }
     }
 }
@@ -307,6 +310,13 @@ fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<()>) {
         }
     }
 
+    // 스트림이 어떤 방식으로 죽어도(오류 통보 없이 조용히 멈추는 경우 포함)
+    // 이 시간 안에는 반드시 새 스트림으로 교체된다.
+    const STALL_LIMIT: Duration = Duration::from_secs(20);
+
+    // 펌프 스레드 → 관제 루프로 프레임을 전달하는 채널 (세대번호로 구분)
+    let (ftx, frx) = mpsc::channel::<(u64, Frame)>();
+
     loop {
         if shared.quit.load(Ordering::Relaxed) {
             return;
@@ -347,79 +357,131 @@ fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<()>) {
             excluded_targets: if excluded.is_empty() { None } else { Some(excluded) },
         };
 
-        let mut capturer = match catch_unwind(AssertUnwindSafe(|| Capturer::build(options))) {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                set_status(&format!("캡처 시작 실패({e}) — 재시도 중"));
+        // ---- 펌프 스레드 시작 ----
+        // get_next_frame()은 스트림이 조용히 죽으면 영원히 잠들 수 있다.
+        // 그래서 프레임 대기는 '희생 가능한' 펌프 스레드에 맡기고,
+        // 이 관제 루프는 타임아웃 있는 수신으로 워치독 역할을 겸한다.
+        let gen = shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+        {
+            let ftx = ftx.clone();
+            let shared = shared.clone();
+            thread::spawn(move || pump_frames(gen, options, ftx, ready_tx, shared));
+        }
+        match ready_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(())) => set_status(""),
+            Ok(Err(msg)) => {
+                set_status(&format!("{msg} — 재시도 중"));
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
             Err(_) => {
-                set_status("캡처 초기화 오류 — 재시도 중");
+                set_status("캡처 시작이 지연되고 있습니다 — 재시도 중");
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
-        };
-
-        if catch_unwind(AssertUnwindSafe(|| capturer.start_capture())).is_err() {
-            set_status("캡처 스트림을 시작하지 못했습니다 — 재시도 중");
-            thread::sleep(Duration::from_secs(2));
-            continue;
         }
-        set_status("");
 
         // 캡처 엔진이 fps 제한을 지원하지 않는 플랫폼(Windows) 대비, 앱 레벨 스로틀 간격.
-        // 설정 fps보다 빨리 도착하는 프레임은 처리 없이 버린다.
         let min_gap = Duration::from_millis((800 / fps.max(1)) as u64);
+        let mut last_hash: u64 = 0;
+        let mut last_proc: Option<Instant> = None;
+        let mut last_frame = Instant::now();
 
-        // 프레임 루프. true 반환 = 완전 종료, false = 스트림 재구성
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let mut last_hash: u64 = 0;
-            let mut last_proc: Option<std::time::Instant> = None;
-            loop {
-                if shared.quit.load(Ordering::Relaxed) {
-                    return true;
-                }
-                if shared.rebuild.swap(false, Ordering::Relaxed) {
-                    return false;
-                }
-                match capturer.get_next_frame() {
-                    Ok(frame) => {
-                        if shared.paused.load(Ordering::Relaxed) {
-                            continue; // 화면 동결: 처리·게시 생략(자원도 거의 안 씀)
-                        }
-                        if let Some(t) = last_proc {
-                            if t.elapsed() < min_gap {
-                                continue; // 설정 fps 초과분은 버림
-                            }
-                        }
-                        let (tw, sigma, _) =
-                            STRENGTHS[shared.strength.load(Ordering::Relaxed) % STRENGTHS.len()];
-                        if let Some(out) = process_frame(&frame, tw, sigma, last_hash) {
-                            last_hash = out.hash;
-                            if let Some(tiny) = out.tiny {
-                                *shared.frame.lock().unwrap() = Some(tiny);
-                                let _ = proxy.send_event(());
-                            }
-                        }
-                        last_proc = Some(std::time::Instant::now());
-                    }
-                    Err(_) => return false, // 스트림 종료/오류 → 재구성
-                }
+        // ---- 관제 루프: 프레임 처리 + 워치독 ----
+        loop {
+            if shared.quit.load(Ordering::Relaxed) {
+                return;
             }
-        }));
-
-        let _ = catch_unwind(AssertUnwindSafe(|| capturer.stop_capture()));
-
-        match outcome {
-            Ok(true) => return,
-            Ok(false) => { /* 설정 변경 등으로 재구성 */ }
-            Err(_) => {
-                set_status("캡처 스트림 오류 — 다시 연결 중");
-                thread::sleep(Duration::from_millis(500));
+            if shared.rebuild.swap(false, Ordering::Relaxed) {
+                break; // 설정 변경 → 스트림 재구성
+            }
+            match frx.recv_timeout(Duration::from_secs(1)) {
+                Ok((g, frame)) => {
+                    if g != gen {
+                        continue; // 이전 세대의 잔여 프레임은 무시
+                    }
+                    last_frame = Instant::now();
+                    if shared.paused.load(Ordering::Relaxed) {
+                        continue; // 화면 동결
+                    }
+                    if let Some(t) = last_proc {
+                        if t.elapsed() < min_gap {
+                            continue; // 설정 fps 초과분은 버림
+                        }
+                    }
+                    let (tw, sigma, _) =
+                        STRENGTHS[shared.strength.load(Ordering::Relaxed) % STRENGTHS.len()];
+                    let processed = catch_unwind(AssertUnwindSafe(|| {
+                        process_frame(&frame, tw, sigma, last_hash)
+                    }))
+                    .unwrap_or(None);
+                    if let Some(out) = processed {
+                        last_hash = out.hash;
+                        if let Some(tiny) = out.tiny {
+                            *shared.frame.lock().unwrap() = Some(tiny);
+                            let _ = proxy.send_event(());
+                        }
+                    }
+                    last_proc = Some(Instant::now());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // 화면이 조용하면 프레임이 안 오는 게 정상이지만, 스트림이 조용히
+                    // 죽은 것과 겉으로는 구분할 수 없다. 그래서 일정 시간 프레임이
+                    // 없으면 스트림을 새로 만든다 — 어느 쪽이었든 화면 멈춤이
+                    // 이 시간 안에 스스로 풀린다.
+                    if last_frame.elapsed() > STALL_LIMIT {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        // 루프 이탈 → 다음 반복에서 세대가 올라가고 새 스트림이 만들어진다.
+        // 이전 펌프 스레드는 자기 세대가 지난 것을 확인하면 스스로 정리하고 종료한다.
     }
+}
+
+/// 펌프 스레드: 캡처 스트림을 만들고 프레임을 관제 루프로 퍼 올린다.
+/// get_next_frame()이 영원히 잠들 수 있으므로 이 스레드는 희생 가능하게 설계했다 —
+/// 자신의 세대가 지나면 다음 프레임 수신 시 스트림을 정리하고 스스로 종료한다.
+fn pump_frames(
+    gen: u64,
+    options: Options,
+    ftx: mpsc::Sender<(u64, Frame)>,
+    ready_tx: mpsc::Sender<Result<(), String>>,
+    shared: Arc<Shared>,
+) {
+    let mut capturer = match catch_unwind(AssertUnwindSafe(|| Capturer::build(options))) {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            let _ = ready_tx.send(Err(format!("캡처 시작 실패({e})")));
+            return;
+        }
+        Err(_) => {
+            let _ = ready_tx.send(Err("캡처 초기화 오류".to_string()));
+            return;
+        }
+    };
+    if catch_unwind(AssertUnwindSafe(|| capturer.start_capture())).is_err() {
+        let _ = ready_tx.send(Err("캡처 스트림을 시작하지 못했습니다".to_string()));
+        return;
+    }
+    let _ = ready_tx.send(Ok(()));
+
+    let _ = catch_unwind(AssertUnwindSafe(|| loop {
+        match capturer.get_next_frame() {
+            Ok(frame) => {
+                let obsolete = shared.generation.load(Ordering::Relaxed) != gen
+                    || shared.quit.load(Ordering::Relaxed);
+                if obsolete || ftx.send((gen, frame)).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }));
+    let _ = catch_unwind(AssertUnwindSafe(|| capturer.stop_capture()));
 }
 
 // ---------------------------------------------------------------------------
@@ -685,9 +747,10 @@ impl ApplicationHandler<()> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
         self.update_title();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        // request_redraw()에 맡기지 않고 즉시 그린다 — 창이 다른 창에 완전히
+        // 가려져 있을 때 macOS가 재그리기 요청을 미루거나 생략할 수 있는데,
+        // 그러면 디스코드가 캡처해 가는 이 창의 내용이 멈춘 것처럼 보인다.
+        self.draw();
     }
 
     fn window_event(
