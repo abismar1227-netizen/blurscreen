@@ -95,6 +95,8 @@ bash packaging/make_app.sh     # 배포용 BlurScreen.app 생성 (dist/ 폴더)
 
 - 보호 화면의 한글 문구는 `tools/gen_text_assets.py`로 미리 그려 둔 마스크입니다
   (Noto Sans CJK KR, SIL Open Font License). 문구를 바꾸면 스크립트를 다시 실행하세요.
+- 앱 아이콘은 `tools/gen_app_icon.py`로 생성합니다 (macOS `.icns`, Windows `.ico`, 창 아이콘).
+  Windows 실행 파일에는 `build.rs`가 빌드할 때 아이콘을 넣습니다.
 - `src/blur.rs`, `src/cover.rs`, `src/icons.rs`, `src/log.rs`는 플랫폼과 무관한 순수 코드라
   어느 OS에서든 단위 테스트할 수 있습니다.
 

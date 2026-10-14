@@ -16,6 +16,8 @@ mkdir -p "$APP/Contents/MacOS"
 cp "$BIN" "$APP/Contents/MacOS/blurscreen"
 chmod +x "$APP/Contents/MacOS/blurscreen"
 cp "$(dirname "$0")/Info.plist" "$APP/Contents/Info.plist"
+mkdir -p "$APP/Contents/Resources"
+cp "$(dirname "$0")/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 # ad-hoc 서명 (Apple Silicon 실행 요건 충족용 — 개발자 계정 불필요)
 codesign --force --deep -s - "$APP"

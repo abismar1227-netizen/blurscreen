@@ -8,6 +8,8 @@
 	<string>BlurScreen</string>
 	<key>CFBundleIdentifier</key>
 	<string>app.blurscreen.BlurScreen</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleExecutable</key>
 	<string>blurscreen</string>
 	<key>CFBundleVersion</key>

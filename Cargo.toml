@@ -20,6 +20,10 @@ dispatch2 = "0.3"
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSProcessInfo", "NSString"] }
 
+# Windows 실행 파일에 앱 아이콘을 넣는 빌드 스크립트용
+[build-dependencies]
+embed-resource = "3"
+
 [profile.release]
 opt-level = 3
 lto = true

@@ -821,6 +821,20 @@ impl ApplicationHandler<UserEvent> for App {
             let attrs = Window::default_attributes()
                 .with_title(WINDOW_TITLE)
                 .with_inner_size(LogicalSize::new(960.0, 560.0));
+            // Windows: 창 제목줄·작업 표시줄 아이콘 (macOS는 앱 번들 아이콘을 씀)
+            #[cfg(target_os = "windows")]
+            let attrs = {
+                use winit::platform::windows::WindowAttributesExtWindows;
+                let icon = || {
+                    winit::window::Icon::from_rgba(
+                        include_bytes!("../assets/icon/window64.rgba").to_vec(),
+                        64,
+                        64,
+                    )
+                    .ok()
+                };
+                attrs.with_window_icon(icon()).with_taskbar_icon(icon())
+            };
             let window = Rc::new(
                 event_loop
                     .create_window(attrs)
