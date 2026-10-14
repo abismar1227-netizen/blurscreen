@@ -1,26 +1,39 @@
-// BlurScreen — 화면공유용 블러 창
+// BlurScreen — 화면공유용 블러 창 (v0.6)
 //
 // 현재 화면을 강하게 블러 처리한 모습을 창 하나로 보여줍니다.
 // 디스코드 등에서 "이 창"만 공유하면 실제 화면(원고)은 절대 나가지 않습니다.
 //
 // 구조:
 //   캡처 스레드: OS 공식 캡처 API(macOS: ScreenCaptureKit / Windows: Graphics.Capture, scap 크레이트)
-//     → 640px 급으로 축소 수신 → 추가 축소(비가역, 텍스트 정보 소멸) → 소형 가우시안 블러
+//     → 640px 급으로 축소 수신 → 추가 축소(비가역, 텍스트 정보 소멸) → 박스 블러
 //     → 공유 슬롯(길이 1, 최신 프레임만 유지)
-//   UI 스레드(winit + softbuffer): 슬롯의 작은 이미지를 창 크기로 확대(bilinear) 표시
+//   UI 스레드(winit + softbuffer): 슬롯의 작은 이미지를 창 크기로 확대 표시.
+//     화면 변화가 없어도 2초마다 다시 그려(생존 신호) 공유 쪽에 새 프레임이 계속 가게 한다.
+//   메뉴 막대/알림 영역 메뉴 + 공유 창 우클릭 메뉴 + 전역 즉시 가림 단축키.
+//   동작 기록: 스트림 재구성·오류·잠자기 복귀 등을 로그 파일로 남김(화면 내용은 기록 안 함).
 //
-// 단축키:  1/2/3 블러 약/중/강 · F fps 전환(5/10/15) · M 모니터 전환 · Space 일시정지(화면 동결)
+// 단축키(창 선택 시):  1/2/3 블러 약/중/강 · F fps 전환 · M 모니터 전환 · Space 동결
+// 전역 단축키:         macOS ⌃⌥⌘B / Windows Ctrl+Alt+Shift+B — 즉시 가림 켜기/끄기
 
 // Windows에서 실행 시 검은 콘솔 창이 같이 뜨지 않게 함
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod action;
+mod blur;
+mod cover;
+mod icons;
+mod log;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod menu;
+mod text_assets;
+
 use std::num::NonZeroU32;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use scap::capturer::{Capturer, Options, Resolution};
 use scap::frame::{Frame, FrameType};
@@ -28,28 +41,29 @@ use scap::Target;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-const WINDOW_TITLE: &str = "Blur Screen";
+use action::Action;
+use blur::{RawFrame, Tiny, STRENGTHS};
+use cover::CoverKind;
 
-/// (블러 후 이미지의 목표 가로 픽셀, 가우시안 시그마, 라벨)
-/// 폭이 작을수록 정보가 더 많이 소멸함 (원본 4K 기준 192px = 1/20 수준)
-const STRENGTHS: [(usize, f32, &str); 3] = [(480, 1.3, "약"), (320, 1.7, "중"), (192, 2.2, "강")];
-const FPS_OPTIONS: [u32; 3] = [5, 10, 15];
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const WINDOW_TITLE: &str = "Blur Screen";
+pub const FPS_OPTIONS: [u32; 3] = [5, 10, 15];
+
+/// 화면 변화가 없어도 이 간격마다 마지막 화면을 다시 그린다 (공유 쪽 생존 신호)
+const KEEPALIVE: Duration = Duration::from_secs(2);
+/// 모니터 구성 확인·통계 기록 주기
+const HOUSEKEEP: Duration = Duration::from_secs(3);
+/// 통계 한 줄을 남기는 주기
+const STATS_EVERY: Duration = Duration::from_secs(600);
 
 // ---------------------------------------------------------------------------
 // 공유 상태
 // ---------------------------------------------------------------------------
-
-/// 블러 처리가 끝난 작은 RGB 이미지
-struct Tiny {
-    w: usize,
-    h: usize,
-    rgb: Vec<u8>, // w*h*3
-}
 
 struct Shared {
     /// 길이 1의 프레임 슬롯 — 항상 최신 프레임만 유지(큐 누적 없음)
@@ -60,12 +74,26 @@ struct Shared {
     fps_idx: AtomicUsize,
     display_idx: AtomicUsize,
     display_count: AtomicUsize,
+    display_names: Mutex<Vec<String>>,
     paused: AtomicBool,
+    /// 즉시 가림 — 켜져 있는 동안 캡처 스트림을 내리고 보호 화면만 보여준다
+    covered: AtomicBool,
+    /// macOS 화면 기록 권한이 없어 기다리는 중
+    need_permission: AtomicBool,
+    /// 공유 창에 상태 배지 표시 (기본 꺼짐)
+    badge: AtomicBool,
     /// fps/모니터 변경 시 캡처 스트림 재구성 요청
     rebuild: AtomicBool,
     quit: AtomicBool,
     /// 현재 유효한 캡처 세대 번호 — 구세대 펌프 스레드가 스스로 종료하는 기준
     generation: AtomicU64,
+    /// 이 앱 공유 창의 시스템 창 번호 (macOS 캡처 제외용, 0 = 모름)
+    own_window_id: AtomicU32,
+    // 통계 (동작 기록용)
+    frames_in: AtomicU64,
+    frames_published: AtomicU64,
+    presents: AtomicU64,
+    rebuilds: AtomicU64,
 }
 
 impl Shared {
@@ -77,12 +105,31 @@ impl Shared {
             fps_idx: AtomicUsize::new(1),  // 기본: 10fps
             display_idx: AtomicUsize::new(0),
             display_count: AtomicUsize::new(1),
+            display_names: Mutex::new(Vec::new()),
             paused: AtomicBool::new(false),
+            covered: AtomicBool::new(false),
+            need_permission: AtomicBool::new(false),
+            badge: AtomicBool::new(false),
             rebuild: AtomicBool::new(false),
             quit: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            own_window_id: AtomicU32::new(0),
+            frames_in: AtomicU64::new(0),
+            frames_published: AtomicU64::new(0),
+            presents: AtomicU64::new(0),
+            rebuilds: AtomicU64::new(0),
         }
     }
+}
+
+/// 이벤트 루프로 보내는 신호
+#[derive(Debug)]
+enum UserEvent {
+    /// 새 프레임 또는 상태 변화 — 다시 그리기
+    Wake,
+    /// 메뉴·전역 단축키 조작
+    #[allow(dead_code)] // 메뉴가 없는 플랫폼에서는 쓰이지 않음
+    Action(Action),
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +151,7 @@ fn load_config(shared: &Shared) {
             "strength" => shared.strength.store(n.min(STRENGTHS.len() - 1), Ordering::Relaxed),
             "fps" => shared.fps_idx.store(n.min(FPS_OPTIONS.len() - 1), Ordering::Relaxed),
             "display" => shared.display_idx.store(n, Ordering::Relaxed),
+            "badge" => shared.badge.store(n != 0, Ordering::Relaxed),
             _ => {}
         }
     }
@@ -112,21 +160,22 @@ fn load_config(shared: &Shared) {
 fn save_config(shared: &Shared) {
     let Some(path) = config_path() else { return };
     let text = format!(
-        "strength={}\nfps={}\ndisplay={}\n",
+        "strength={}\nfps={}\ndisplay={}\nbadge={}\n",
         shared.strength.load(Ordering::Relaxed),
         shared.fps_idx.load(Ordering::Relaxed),
         shared.display_idx.load(Ordering::Relaxed),
+        shared.badge.load(Ordering::Relaxed) as u8,
     );
     let _ = std::fs::write(path, text);
 }
 
 // ---------------------------------------------------------------------------
-// 이미지 처리 (캡처 스레드에서 실행)
+// 캡처 스레드
 // ---------------------------------------------------------------------------
 
-/// 프레임에서 (가로, 세로, 데이터, 픽셀 크기, [R,G,B] 채널 위치)를 꺼낸다.
-/// 플랫폼별로 도착하는 픽셀 포맷이 달라도 전부 처리할 수 있게 해 둠.
-fn frame_parts(frame: &Frame) -> Option<(usize, usize, &[u8], usize, [usize; 3])> {
+/// 프레임에서 원시 픽셀 정보를 꺼낸다. 플랫폼별로 도착하는 픽셀 포맷이 달라도 처리.
+/// macOS의 "변화 없음(idle)" 신호는 크기 0인 프레임으로 오며, 여기서 None이 된다.
+fn frame_parts(frame: &Frame) -> Option<RawFrame<'_>> {
     let (w, h, data, px, rgb) = match frame {
         Frame::BGRA(f) => (f.width, f.height, &f.data, 4, [2, 1, 0]),
         Frame::BGRx(f) => (f.width, f.height, &f.data, 4, [2, 1, 0]),
@@ -139,152 +188,20 @@ fn frame_parts(frame: &Frame) -> Option<(usize, usize, &[u8], usize, [usize; 3])
     if w <= 0 || h <= 0 {
         return None;
     }
-    Some((w as usize, h as usize, data.as_slice(), px, rgb))
+    Some(RawFrame { w: w as usize, h: h as usize, data: data.as_slice(), px, rgb })
 }
 
-/// 프레임 처리 결과. 내용이 직전과 같으면 tiny가 None (게시·그리기 생략).
-struct Processed {
-    hash: u64,
-    tiny: Option<Tiny>,
-}
-
-/// 축소(박스 평균, 비가역) 후 블러를 적용한 작은 이미지를 만든다.
-/// 축소 결과의 해시가 직전 프레임과 같으면 블러·게시를 통째로 건너뛴다.
-fn process_frame(frame: &Frame, target_w: usize, sigma: f32, prev_hash: u64) -> Option<Processed> {
-    let (w, h, data, px, [ri, gi, bi]) = frame_parts(frame)?;
-    if data.len() < w * h * px {
-        return None;
-    }
-    let tw = target_w.clamp(2, w.max(2));
-    let th = ((h * tw + w / 2) / w).clamp(2, h.max(2));
-
-    // 입력이 아주 클 때(Windows에서 원본 해상도가 그대로 올 때 등)는
-    // 픽셀을 건너뛰며 샘플링해 연산량을 일정하게 유지한다.
-    // bin 하나의 폭이 step의 3배 이상이 되도록 잡아 빈 bin이 생기지 않게 함.
-    let step = (w / (tw * 3)).max(1);
-
-    let mut acc = vec![0u32; tw * th * 3];
-    let mut cnt = vec![0u32; tw * th];
-    let mut y = 0;
-    while y < h {
-        let ty = (y * th / h).min(th - 1);
-        let row = &data[y * w * px..(y + 1) * w * px];
-        let mut x = 0;
-        while x < w {
-            let tx = (x * tw / w).min(tw - 1);
-            let p = &row[x * px..x * px + px];
-            let a = (ty * tw + tx) * 3;
-            acc[a] += p[ri] as u32;
-            acc[a + 1] += p[gi] as u32;
-            acc[a + 2] += p[bi] as u32;
-            cnt[ty * tw + tx] += 1;
-            x += step;
-        }
-        y += step;
-    }
-
-    let mut rgb = vec![0u8; tw * th * 3];
-    // FNV-1a 해시를 함께 계산해 "내용이 안 바뀐 프레임"을 감지한다
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for i in 0..tw * th {
-        let c = cnt[i].max(1);
-        let r = (acc[i * 3] / c) as u8;
-        let g = (acc[i * 3 + 1] / c) as u8;
-        let b = (acc[i * 3 + 2] / c) as u8;
-        rgb[i * 3] = r;
-        rgb[i * 3 + 1] = g;
-        rgb[i * 3 + 2] = b;
-        let px = ((r as u64) << 16) | ((g as u64) << 8) | (b as u64);
-        hash = (hash ^ px).wrapping_mul(0x0000_0100_0000_01B3);
-    }
-
-    if hash == prev_hash {
-        // 블러 결과도 동일할 것이므로 여기서 끝 — 게시·그리기 생략
-        return Some(Processed { hash, tiny: None });
-    }
-
-    box_blur(&mut rgb, tw, th, sigma);
-    Some(Processed {
-        hash,
-        tiny: Some(Tiny { w: tw, h: th, rgb }),
-    })
-}
-
-/// 러닝섬 방식 박스 블러 2회 반복(가우시안 근사). 커널 크기와 무관하게 픽셀당 비용이
-/// 일정해서 기존 가우시안 컨볼루션보다 수 배 저렴하다.
-fn box_blur(rgb: &mut [u8], w: usize, h: usize, sigma: f32) {
-    let r = (sigma.round() as usize).max(1);
-    if w < 2 || h < 2 {
-        return;
-    }
-    let mut tmp = vec![0u8; rgb.len()];
-    for _ in 0..2 {
-        box_pass_h(rgb, &mut tmp, w, h, r);
-        box_pass_v(&tmp, rgb, w, h, r);
-    }
-}
-
-fn box_pass_h(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
-    let norm = (2 * r + 1) as u32;
-    let recip = (65536 + norm / 2) / norm; // 나눗셈 대신 고정소수 곱
-    for y in 0..h {
-        let row = &src[y * w * 3..(y + 1) * w * 3];
-        let orow = &mut dst[y * w * 3..(y + 1) * w * 3];
-        let idx = |x: isize| -> usize { x.clamp(0, w as isize - 1) as usize * 3 };
-        let mut s = [0u32; 3];
-        for o in -(r as isize)..=(r as isize) {
-            let p = idx(o);
-            s[0] += row[p] as u32;
-            s[1] += row[p + 1] as u32;
-            s[2] += row[p + 2] as u32;
-        }
-        for x in 0..w {
-            orow[x * 3] = ((s[0] * recip) >> 16) as u8;
-            orow[x * 3 + 1] = ((s[1] * recip) >> 16) as u8;
-            orow[x * 3 + 2] = ((s[2] * recip) >> 16) as u8;
-            let ap = idx(x as isize + 1 + r as isize);
-            let rp = idx(x as isize - r as isize);
-            s[0] = s[0] + row[ap] as u32 - row[rp] as u32;
-            s[1] = s[1] + row[ap + 1] as u32 - row[rp + 1] as u32;
-            s[2] = s[2] + row[ap + 2] as u32 - row[rp + 2] as u32;
-        }
-    }
-}
-
-fn box_pass_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
-    let norm = (2 * r + 1) as u32;
-    let recip = (65536 + norm / 2) / norm;
-    let idx = |y: isize| -> usize { y.clamp(0, h as isize - 1) as usize };
-    let stride = w * 3;
-    // 열 방향 러닝섬을 행 단위로 유지해 캐시 친화적으로 처리
-    let mut s = vec![0u32; stride];
-    for o in -(r as isize)..=(r as isize) {
-        let row = &src[idx(o) * stride..(idx(o) + 1) * stride];
-        for (si, &v) in s.iter_mut().zip(row.iter()) {
-            *si += v as u32;
-        }
-    }
-    for y in 0..h {
-        let orow = &mut dst[y * stride..(y + 1) * stride];
-        for (o, &si) in orow.iter_mut().zip(s.iter()) {
-            *o = ((si * recip) >> 16) as u8;
-        }
-        let add = &src[idx(y as isize + 1 + r as isize) * stride..][..stride];
-        let rem = &src[idx(y as isize - r as isize) * stride..][..stride];
-        for i in 0..stride {
-            s[i] = s[i] + add[i] as u32 - rem[i] as u32;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 캡처 스레드
-// ---------------------------------------------------------------------------
-
-fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<()>) {
+fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<UserEvent>) {
     let set_status = |msg: &str| {
-        *shared.status.lock().unwrap() = msg.to_string();
-        let _ = proxy.send_event(());
+        let mut s = shared.status.lock().unwrap();
+        if *s != msg {
+            if !msg.is_empty() {
+                log::event(&format!("상태: {msg}"));
+            }
+            *s = msg.to_string();
+        }
+        drop(s);
+        let _ = proxy.send_event(UserEvent::Wake);
     };
 
     if !scap::is_supported() {
@@ -294,6 +211,7 @@ fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<()>) {
 
     if !scap::has_permission() {
         scap::request_permission();
+        shared.need_permission.store(true, Ordering::Relaxed);
         set_status("화면 기록 권한이 필요합니다 — 시스템 설정 › 개인정보 보호 › 화면 기록에서 허용한 뒤 앱을 다시 실행해 주세요");
         // 권한이 즉시 반영되는 환경을 위해 잠시 재확인
         for _ in 0..150 {
@@ -308,18 +226,41 @@ fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<()>) {
         if !scap::has_permission() {
             return;
         }
+        shared.need_permission.store(false, Ordering::Relaxed);
+        log::event("화면 기록 권한 확인됨");
     }
 
     // 스트림이 어떤 방식으로 죽어도(오류 통보 없이 조용히 멈추는 경우 포함)
     // 이 시간 안에는 반드시 새 스트림으로 교체된다.
     const STALL_LIMIT: Duration = Duration::from_secs(20);
+    // 한 번의 대기(최대 1초)가 이보다 길게 걸렸다면 시스템이 잠들었다 깨어난 것으로 본다
+    const SLEEP_GAP: Duration = Duration::from_secs(8);
+    // 이 이상 프레임이 끊겼다가 다시 오면 기록해 둔다
+    const GAP_NOTE: Duration = Duration::from_secs(15);
 
     // 펌프 스레드 → 관제 루프로 프레임을 전달하는 채널 (세대번호로 구분)
     let (ftx, frx) = mpsc::channel::<(u64, Frame)>();
+    let mut was_covered = false;
 
     loop {
         if shared.quit.load(Ordering::Relaxed) {
             return;
+        }
+
+        // ---- 즉시 가림 중: 스트림 없이 대기 ----
+        if shared.covered.load(Ordering::Relaxed) {
+            if !was_covered {
+                was_covered = true;
+                // 세대를 올려 기존 펌프 스레드가 다음 프레임에서 스트림을 정리하게 한다
+                shared.generation.fetch_add(1, Ordering::Relaxed);
+                log::event("즉시 가림: 캡처 스트림 중지");
+            }
+            thread::sleep(Duration::from_millis(150));
+            continue;
+        }
+        if was_covered {
+            was_covered = false;
+            log::event("가림 해제: 캡처 재개");
         }
 
         // ---- 펌프 스레드 시작 ----
@@ -330,14 +271,19 @@ fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<()>) {
         // 캡처 대상(Target)은 Windows에서 스레드 간 이동이 불가능한 원시 핸들을
         // 담고 있어서, 옵션 구성은 여기서 하지 않고 펌프 스레드 안에서 한다.
         let gen = shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+        shared.rebuilds.fetch_add(1, Ordering::Relaxed);
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<String, String>>();
         {
             let ftx = ftx.clone();
             let shared = shared.clone();
-            thread::spawn(move || pump_frames(gen, ftx, ready_tx, shared));
+            let proxy = proxy.clone();
+            thread::spawn(move || pump_frames(gen, ftx, ready_tx, shared, proxy));
         }
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(())) => set_status(""),
+            Ok(Ok(desc)) => {
+                log::event(&format!("캡처 시작 (세대 {gen}, {desc})"));
+                set_status("");
+            }
             Ok(Err(msg)) => {
                 set_status(&format!("{msg} — 재시도 중"));
                 thread::sleep(Duration::from_secs(2));
@@ -356,21 +302,47 @@ fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<()>) {
         let mut last_hash: u64 = 0;
         let mut last_proc: Option<Instant> = None;
         let mut last_frame = Instant::now();
+        let mut last_tick = (Instant::now(), SystemTime::now());
 
         // ---- 관제 루프: 프레임 처리 + 워치독 ----
-        loop {
+        let reason: String = loop {
             if shared.quit.load(Ordering::Relaxed) {
                 return;
             }
-            if shared.rebuild.swap(false, Ordering::Relaxed) {
-                break; // 설정 변경 → 스트림 재구성
+            if shared.covered.load(Ordering::Relaxed) {
+                break "즉시 가림".into();
             }
+            if shared.rebuild.swap(false, Ordering::Relaxed) {
+                break "설정 변경".into(); // fps·모니터 변경 → 스트림 재구성
+            }
+
+            // 잠자기 복귀 감지: 1초짜리 대기가 비정상적으로 길었는지
+            // (단조 시계가 잠자는 동안 멈추는 OS도 있으므로 벽시계와 둘 다 본다)
+            let now = (Instant::now(), SystemTime::now());
+            let mono_gap = now.0.duration_since(last_tick.0);
+            let wall_gap = now.1.duration_since(last_tick.1).unwrap_or_default();
+            last_tick = now;
+            if mono_gap > SLEEP_GAP || wall_gap > SLEEP_GAP {
+                break format!(
+                    "잠자기 복귀 추정 (대기 공백 {:.0}초)",
+                    mono_gap.max(wall_gap).as_secs_f32()
+                );
+            }
+
             match frx.recv_timeout(Duration::from_secs(1)) {
                 Ok((g, frame)) => {
                     if g != gen {
                         continue; // 이전 세대의 잔여 프레임은 무시
                     }
+                    let gap = last_frame.elapsed();
+                    if gap > GAP_NOTE {
+                        log::event(&format!("프레임 공백 {:.1}초 후 수신 재개", gap.as_secs_f32()));
+                    }
                     last_frame = Instant::now();
+                    let Some(raw) = frame_parts(&frame) else {
+                        continue; // 변화 없음(idle) 신호 — 스트림이 살아 있다는 뜻
+                    };
+                    shared.frames_in.fetch_add(1, Ordering::Relaxed);
                     if shared.paused.load(Ordering::Relaxed) {
                         continue; // 화면 동결
                     }
@@ -382,30 +354,34 @@ fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<()>) {
                     let (tw, sigma, _) =
                         STRENGTHS[shared.strength.load(Ordering::Relaxed) % STRENGTHS.len()];
                     let processed = catch_unwind(AssertUnwindSafe(|| {
-                        process_frame(&frame, tw, sigma, last_hash)
+                        blur::process_frame(&raw, tw, sigma, last_hash)
                     }))
                     .unwrap_or(None);
                     if let Some(out) = processed {
                         last_hash = out.hash;
                         if let Some(tiny) = out.tiny {
-                            *shared.frame.lock().unwrap() = Some(tiny);
-                            let _ = proxy.send_event(());
+                            // 가림이 켜진 직후 도착한 프레임은 게시하지 않는다
+                            if !shared.covered.load(Ordering::Relaxed) {
+                                *shared.frame.lock().unwrap() = Some(tiny);
+                                shared.frames_published.fetch_add(1, Ordering::Relaxed);
+                                let _ = proxy.send_event(UserEvent::Wake);
+                            }
                         }
                     }
                     last_proc = Some(Instant::now());
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // 화면이 조용하면 프레임이 안 오는 게 정상이지만, 스트림이 조용히
-                    // 죽은 것과 겉으로는 구분할 수 없다. 그래서 일정 시간 프레임이
-                    // 없으면 스트림을 새로 만든다 — 어느 쪽이었든 화면 멈춤이
-                    // 이 시간 안에 스스로 풀린다.
+                    // macOS는 화면이 조용해도 '변화 없음' 신호가 오므로 여기까지 오면
+                    // 스트림이 조용히 죽은 것이다. Windows는 변화가 있을 때만 프레임이
+                    // 오므로 조용한 화면에서도 재구성될 수 있다 — 어느 쪽이든 무해하다.
                     if last_frame.elapsed() > STALL_LIMIT {
-                        break;
+                        break format!("워치독: {}초간 프레임 없음", STALL_LIMIT.as_secs());
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break "펌프 채널 끊김".into(),
             }
-        }
+        };
+        log::event(&format!("스트림 재구성 (세대 {gen}, 사유: {reason})"));
         // 루프 이탈 → 다음 반복에서 세대가 올라가고 새 스트림이 만들어진다.
         // 이전 펌프 스레드는 자기 세대가 지난 것을 확인하면 스스로 정리하고 종료한다.
     }
@@ -417,8 +393,9 @@ fn capture_thread(shared: Arc<Shared>, proxy: EventLoopProxy<()>) {
 fn pump_frames(
     gen: u64,
     ftx: mpsc::Sender<(u64, Frame)>,
-    ready_tx: mpsc::Sender<Result<(), String>>,
+    ready_tx: mpsc::Sender<Result<String, String>>,
     shared: Arc<Shared>,
+    proxy: EventLoopProxy<UserEvent>,
 ) {
     // 대상 디스플레이와 제외 창 목록 구성 (Target은 이 스레드 밖으로 내보내지 않는다)
     let targets = catch_unwind(scap::get_all_targets).unwrap_or_default();
@@ -431,18 +408,38 @@ fn pump_frames(
         let _ = ready_tx.send(Err("캡처할 디스플레이를 찾지 못했습니다".to_string()));
         return;
     }
+    let names: Vec<String> = displays
+        .iter()
+        .map(|t| match t {
+            Target::Display(d) => d.title.clone(),
+            _ => String::new(),
+        })
+        .collect();
     shared.display_count.store(displays.len(), Ordering::Relaxed);
+    {
+        let mut cur = shared.display_names.lock().unwrap();
+        if *cur != names {
+            *cur = names;
+            let _ = proxy.send_event(UserEvent::Wake); // 메뉴의 모니터 목록 갱신
+        }
+    }
     let di = shared.display_idx.load(Ordering::Relaxed) % displays.len();
 
     // 자기 자신(블러 창)은 캡처에서 제외 → 거울 속 거울 방지 (macOS에서 동작)
+    // 창 번호로 찾고, 번호를 모를 때는 제목으로 찾는다.
+    let own_id = shared.own_window_id.load(Ordering::Relaxed);
     let excluded: Vec<Target> = targets
         .iter()
-        .filter(|t| matches!(t, Target::Window(w) if w.title.starts_with(WINDOW_TITLE)))
+        .filter(|t| {
+            matches!(t, Target::Window(w)
+                if (own_id != 0 && w.id == own_id) || w.title.starts_with(WINDOW_TITLE))
+        })
         .cloned()
         .collect();
 
+    let fps = FPS_OPTIONS[shared.fps_idx.load(Ordering::Relaxed) % FPS_OPTIONS.len()];
     let options = Options {
-        fps: FPS_OPTIONS[shared.fps_idx.load(Ordering::Relaxed) % FPS_OPTIONS.len()],
+        fps,
         show_cursor: true,
         show_highlight: false,
         target: Some(displays[di].clone()),
@@ -450,7 +447,7 @@ fn pump_frames(
         output_type: FrameType::BGRAFrame,
         // 캡처 단계에서 이미 640px 급으로 GPU 축소 → 이후 연산이 전부 가벼워짐
         output_resolution: Resolution::_480p,
-        excluded_targets: if excluded.is_empty() { None } else { Some(excluded) },
+        excluded_targets: if excluded.is_empty() { None } else { Some(excluded.clone()) },
     };
 
     let mut capturer = match catch_unwind(AssertUnwindSafe(|| Capturer::build(options))) {
@@ -468,7 +465,12 @@ fn pump_frames(
         let _ = ready_tx.send(Err("캡처 스트림을 시작하지 못했습니다".to_string()));
         return;
     }
-    let _ = ready_tx.send(Ok(()));
+    let _ = ready_tx.send(Ok(format!(
+        "모니터 {}/{}, {fps}fps, 자기 창 제외 {}개",
+        di + 1,
+        displays.len(),
+        excluded.len()
+    )));
 
     let _ = catch_unwind(AssertUnwindSafe(|| loop {
         match capturer.get_next_frame() {
@@ -486,171 +488,69 @@ fn pump_frames(
 }
 
 // ---------------------------------------------------------------------------
-// 표시 (UI 스레드)
-// ---------------------------------------------------------------------------
-
-/// 작은 블러 이미지를 창 크기로 확대해 그린다. 여백은 어두운 회색.
-///
-/// 비용이 창 크기에 비례해 커지지 않도록, 비싼 보간(bilinear)은 폭 1024px까지만
-/// 수행하고 그 이상은 값 복제(nearest)로 채운다. 블러 화면 특성상 시각적 차이가 없고,
-/// 레티나 풀스크린 창에서도 보간 연산량이 일정하게 유지된다.
-fn draw_tiny(tiny: &Tiny, out: &mut [u32], bw: usize, bh: usize) {
-    const BG: u32 = 0x0014_1418;
-    if tiny.w < 1 || tiny.h < 1 {
-        out.fill(BG);
-        return;
-    }
-
-    // 화면 비율 유지(레터박스)
-    let scale = f64::min(bw as f64 / tiny.w as f64, bh as f64 / tiny.h as f64);
-    let dw = ((tiny.w as f64 * scale).round() as usize).clamp(1, bw);
-    let dh = ((tiny.h as f64 * scale).round() as usize).clamp(1, bh);
-    let ox = (bw - dw) / 2;
-    let oy = (bh - dh) / 2;
-
-    // 여백(레터박스)만 배경색으로 칠한다 — 전체 채우기 낭비 제거
-    for y in 0..oy {
-        out[y * bw..(y + 1) * bw].fill(BG);
-    }
-    for y in oy + dh..bh {
-        out[y * bw..(y + 1) * bw].fill(BG);
-    }
-    if ox > 0 || ox + dw < bw {
-        for y in oy..oy + dh {
-            out[y * bw..y * bw + ox].fill(BG);
-            out[y * bw + ox + dw..(y + 1) * bw].fill(BG);
-        }
-    }
-
-    // 중간 해상도 결정: 보간은 여기까지만
-    const MID_CAP: usize = 1024;
-    let (mw, mh) = if dw > MID_CAP {
-        (MID_CAP, ((dh * MID_CAP + dw / 2) / dw).max(1))
-    } else {
-        (dw, dh)
-    };
-
-    let mid = bilinear_u32(tiny, mw, mh);
-
-    if mw == dw && mh == dh {
-        // 창이 작으면 보간 결과를 그대로 복사
-        for y in 0..dh {
-            let o = (oy + y) * bw + ox;
-            out[o..o + dw].copy_from_slice(&mid[y * mw..(y + 1) * mw]);
-        }
-    } else {
-        // 값 복제 확대: 행 하나를 만들어 두고 같은 소스 행이 반복되는 동안 memcpy만 수행
-        let xmap: Vec<usize> = (0..dw).map(|x| x * mw / dw).collect();
-        let mut row = vec![0u32; dw];
-        let mut last_sy = usize::MAX;
-        for y in 0..dh {
-            let sy = (y * mh / dh).min(mh - 1);
-            if sy != last_sy {
-                let srow = &mid[sy * mw..(sy + 1) * mw];
-                for (dst, &sx) in row.iter_mut().zip(xmap.iter()) {
-                    *dst = srow[sx];
-                }
-                last_sy = sy;
-            }
-            let o = (oy + y) * bw + ox;
-            out[o..o + dw].copy_from_slice(&row);
-        }
-    }
-}
-
-/// tiny를 dw×dh로 분리형 bilinear 확대해 packed 0RGB(u32) 버퍼로 반환.
-fn bilinear_u32(tiny: &Tiny, dw: usize, dh: usize) -> Vec<u32> {
-    struct Map {
-        i0: usize,
-        i1: usize,
-        f: u32, // 0..256 고정소수
-    }
-    let make_map = |dst: usize, src: usize| -> Vec<Map> {
-        (0..dst)
-            .map(|d| {
-                let pos = ((d as f64 + 0.5) / dst as f64 * src as f64 - 0.5).max(0.0);
-                let i0 = (pos.floor() as usize).min(src - 1);
-                let i1 = (i0 + 1).min(src - 1);
-                let f = ((pos - i0 as f64) * 256.0).round().clamp(0.0, 256.0) as u32;
-                Map { i0, i1, f }
-            })
-            .collect()
-    };
-    let xmap = make_map(dw, tiny.w);
-    let ymap = make_map(dh, tiny.h);
-
-    // 가로 패스: tiny(w×h) → tmp(dw×h)
-    let mut tmp = vec![0u8; dw * tiny.h * 3];
-    for y in 0..tiny.h {
-        let row = &tiny.rgb[y * tiny.w * 3..(y + 1) * tiny.w * 3];
-        let orow = &mut tmp[y * dw * 3..(y + 1) * dw * 3];
-        for (x, m) in xmap.iter().enumerate() {
-            let p0 = &row[m.i0 * 3..m.i0 * 3 + 3];
-            let p1 = &row[m.i1 * 3..m.i1 * 3 + 3];
-            let g = 256 - m.f;
-            orow[x * 3] = ((p0[0] as u32 * g + p1[0] as u32 * m.f) >> 8) as u8;
-            orow[x * 3 + 1] = ((p0[1] as u32 * g + p1[1] as u32 * m.f) >> 8) as u8;
-            orow[x * 3 + 2] = ((p0[2] as u32 * g + p1[2] as u32 * m.f) >> 8) as u8;
-        }
-    }
-    // 세로 패스: tmp → mid
-    let mut mid = vec![0u32; dw * dh];
-    for (y, m) in ymap.iter().enumerate() {
-        let r0 = &tmp[m.i0 * dw * 3..(m.i0 + 1) * dw * 3];
-        let r1 = &tmp[m.i1 * dw * 3..(m.i1 + 1) * dw * 3];
-        let g = 256 - m.f;
-        let orow = &mut mid[y * dw..(y + 1) * dw];
-        for x in 0..dw {
-            let rr = (r0[x * 3] as u32 * g + r1[x * 3] as u32 * m.f) >> 8;
-            let gg = (r0[x * 3 + 1] as u32 * g + r1[x * 3 + 1] as u32 * m.f) >> 8;
-            let bb = (r0[x * 3 + 2] as u32 * g + r1[x * 3 + 2] as u32 * m.f) >> 8;
-            orow[x] = (rr << 16) | (gg << 8) | bb;
-        }
-    }
-    mid
-}
-
-// ---------------------------------------------------------------------------
 // winit 앱
 // ---------------------------------------------------------------------------
 
 struct App {
     shared: Arc<Shared>,
-    proxy: EventLoopProxy<()>,
+    proxy: EventLoopProxy<UserEvent>,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     capture_started: bool,
     last_title: String,
+    last_present: Instant,
+    last_housekeep: Instant,
+    last_stats: Instant,
+    stats_base: [u64; 4],
+    monitor_sig: Option<Vec<(String, u32, u32, i32, i32)>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    menu: Option<menu::AppMenu>,
 }
 
 impl App {
-    fn update_title(&mut self) {
-        let Some(window) = &self.window else { return };
+    fn status_text(&self) -> String {
         let s = &self.shared;
         let status = s.status.lock().unwrap().clone();
-        let title = if status.is_empty() {
-            let (_, _, name) = STRENGTHS[s.strength.load(Ordering::Relaxed) % STRENGTHS.len()];
-            let fps = FPS_OPTIONS[s.fps_idx.load(Ordering::Relaxed) % FPS_OPTIONS.len()];
-            let paused = if s.paused.load(Ordering::Relaxed) {
-                " · 일시정지"
-            } else {
-                ""
-            };
-            let disp = {
-                let n = s.display_count.load(Ordering::Relaxed);
-                if n > 1 {
-                    format!(" · 모니터 {}/{}", s.display_idx.load(Ordering::Relaxed) % n + 1, n)
-                } else {
-                    String::new()
-                }
-            };
-            format!("{WINDOW_TITLE} — 블러 {name} · {fps}fps{disp}{paused}")
+        if s.covered.load(Ordering::Relaxed) {
+            return "즉시 가림 중".to_string();
+        }
+        if !status.is_empty() {
+            return status;
+        }
+        let (_, _, name) = STRENGTHS[s.strength.load(Ordering::Relaxed) % STRENGTHS.len()];
+        let fps = FPS_OPTIONS[s.fps_idx.load(Ordering::Relaxed) % FPS_OPTIONS.len()];
+        let mode = if s.paused.load(Ordering::Relaxed) { "동결" } else { "실시간" };
+        let n = s.display_count.load(Ordering::Relaxed);
+        let disp = if n > 1 {
+            format!(" · 모니터 {}/{}", s.display_idx.load(Ordering::Relaxed) % n + 1, n)
         } else {
-            format!("{WINDOW_TITLE} — {status}")
+            String::new()
         };
-        if title != self.last_title {
-            window.set_title(&title);
-            self.last_title = title;
+        format!("{mode} · 블러 {name} · {fps}fps{disp}")
+    }
+
+    fn update_title(&mut self) {
+        let status = self.status_text();
+        let title = format!("{WINDOW_TITLE} — {status}");
+        if let Some(window) = &self.window {
+            if title != self.last_title {
+                window.set_title(&title);
+                self.last_title = title;
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if let Some(m) = &mut self.menu {
+            let s = &self.shared;
+            m.update(&menu::MenuState {
+                status_line: status,
+                covered: s.covered.load(Ordering::Relaxed),
+                frozen: s.paused.load(Ordering::Relaxed),
+                strength: s.strength.load(Ordering::Relaxed),
+                fps_idx: s.fps_idx.load(Ordering::Relaxed),
+                display_idx: s.display_idx.load(Ordering::Relaxed),
+                display_names: s.display_names.lock().unwrap().clone(),
+                badge: s.badge.load(Ordering::Relaxed),
+            });
         }
     }
 
@@ -669,56 +569,253 @@ impl App {
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
         };
-        {
-            let guard = self.shared.frame.lock().unwrap();
+        let (w, h) = (bw.get() as usize, bh.get() as usize);
+        let s = &self.shared;
+        if s.covered.load(Ordering::Relaxed) {
+            cover::draw_cover(&mut buffer, w, h, CoverKind::Covered);
+        } else {
+            let guard = s.frame.lock().unwrap();
             match guard.as_ref() {
-                Some(tiny) => draw_tiny(tiny, &mut buffer, bw.get() as usize, bh.get() as usize),
-                None => buffer.fill(0x0014_1418),
+                Some(tiny) => {
+                    blur::draw_tiny(tiny, &mut buffer, w, h);
+                    if s.badge.load(Ordering::Relaxed) {
+                        cover::draw_badge(&mut buffer, w, h, s.paused.load(Ordering::Relaxed));
+                    }
+                }
+                None => {
+                    let kind = if s.need_permission.load(Ordering::Relaxed) {
+                        CoverKind::Permission
+                    } else if !s.status.lock().unwrap().is_empty() {
+                        CoverKind::Reconnecting
+                    } else {
+                        CoverKind::Connecting
+                    };
+                    cover::draw_cover(&mut buffer, w, h, kind);
+                }
             }
         }
         let _ = buffer.present();
+        self.last_present = Instant::now();
+        s.presents.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn on_key(&mut self, event: KeyEvent) {
+    /// 키보드·메뉴·전역 단축키 조작을 처리한다
+    fn apply(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        let s = self.shared.clone();
+        match action {
+            Action::ToggleCover => {
+                let now = !s.covered.load(Ordering::Relaxed);
+                s.covered.store(now, Ordering::Relaxed);
+                if now {
+                    // 캐시된 블러 화면도 지운다 — 가림 해제 시 새 화면부터 보여준다
+                    *s.frame.lock().unwrap() = None;
+                    s.paused.store(false, Ordering::Relaxed);
+                }
+                log::event(if now { "즉시 가림 켬" } else { "즉시 가림 끔" });
+            }
+            Action::ToggleFreeze => {
+                if s.covered.load(Ordering::Relaxed) {
+                    return;
+                }
+                let p = !s.paused.load(Ordering::Relaxed);
+                s.paused.store(p, Ordering::Relaxed);
+                log::event(if p { "화면 동결" } else { "동결 해제" });
+            }
+            Action::Strength(i) => {
+                s.strength.store(i.min(STRENGTHS.len() - 1), Ordering::Relaxed);
+            }
+            Action::Fps(i) => {
+                s.fps_idx.store(i.min(FPS_OPTIONS.len() - 1), Ordering::Relaxed);
+                s.rebuild.store(true, Ordering::Relaxed);
+            }
+            Action::CycleFps => {
+                let i = (s.fps_idx.load(Ordering::Relaxed) + 1) % FPS_OPTIONS.len();
+                s.fps_idx.store(i, Ordering::Relaxed);
+                s.rebuild.store(true, Ordering::Relaxed);
+            }
+            Action::Monitor(i) => {
+                s.display_idx.store(i, Ordering::Relaxed);
+                s.rebuild.store(true, Ordering::Relaxed);
+            }
+            Action::CycleMonitor => {
+                let n = s.display_count.load(Ordering::Relaxed).max(1);
+                let i = (s.display_idx.load(Ordering::Relaxed) + 1) % n;
+                s.display_idx.store(i, Ordering::Relaxed);
+                s.rebuild.store(true, Ordering::Relaxed);
+            }
+            Action::ToggleBadge => {
+                let b = !s.badge.load(Ordering::Relaxed);
+                s.badge.store(b, Ordering::Relaxed);
+            }
+            Action::OpenPermission => {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = std::process::Command::new("open")
+                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+                        .spawn();
+                }
+                return;
+            }
+            Action::OpenLogs => {
+                if let Some(dir) = log::dir() {
+                    #[cfg(target_os = "macos")]
+                    let _ = std::process::Command::new("open").arg(&dir).spawn();
+                    #[cfg(target_os = "windows")]
+                    let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                    let _ = dir;
+                }
+                return;
+            }
+            Action::Quit => {
+                self.shutdown();
+                event_loop.exit();
+                return;
+            }
+        }
+        save_config(&s);
+        self.update_title();
+        self.draw();
+    }
+
+    fn shutdown(&mut self) {
+        if self.shared.quit.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        save_config(&self.shared);
+        log::flush();
+    }
+
+    fn on_key(&mut self, event: KeyEvent, event_loop: &ActiveEventLoop) {
         if event.state != ElementState::Pressed || event.repeat {
             return;
         }
-        let s = &self.shared;
-        let mut needs_rebuild = false;
-        match &event.logical_key {
+        let action = match &event.logical_key {
             Key::Character(c) => match c.as_str() {
-                "1" => s.strength.store(0, Ordering::Relaxed),
-                "2" => s.strength.store(1, Ordering::Relaxed),
-                "3" => s.strength.store(2, Ordering::Relaxed),
+                "1" => Action::Strength(0),
+                "2" => Action::Strength(1),
+                "3" => Action::Strength(2),
                 // 한글 입력 상태에서도 동작하도록 자판 위치의 한글 자모도 함께 매핑
-                "f" | "F" | "ㄹ" => {
-                    let i = (s.fps_idx.load(Ordering::Relaxed) + 1) % FPS_OPTIONS.len();
-                    s.fps_idx.store(i, Ordering::Relaxed);
-                    needs_rebuild = true;
-                }
-                "m" | "M" | "ㅡ" => {
-                    let n = s.display_count.load(Ordering::Relaxed).max(1);
-                    let i = (s.display_idx.load(Ordering::Relaxed) + 1) % n;
-                    s.display_idx.store(i, Ordering::Relaxed);
-                    needs_rebuild = true;
-                }
+                "f" | "F" | "ㄹ" => Action::CycleFps,
+                "m" | "M" | "ㅡ" => Action::CycleMonitor,
                 _ => return,
             },
-            Key::Named(NamedKey::Space) => {
-                let p = s.paused.load(Ordering::Relaxed);
-                s.paused.store(!p, Ordering::Relaxed);
-            }
+            Key::Named(NamedKey::Space) => Action::ToggleFreeze,
             _ => return,
+        };
+        self.apply(action, event_loop);
+    }
+
+    /// 주기 점검: 모니터 구성 변경 감지, 통계 기록
+    fn housekeep(&mut self, event_loop: &ActiveEventLoop) {
+        self.last_housekeep = Instant::now();
+
+        let sig: Vec<(String, u32, u32, i32, i32)> = event_loop
+            .available_monitors()
+            .map(|m| {
+                let size = m.size();
+                let pos = m.position();
+                (m.name().unwrap_or_default(), size.width, size.height, pos.x, pos.y)
+            })
+            .collect();
+        match &self.monitor_sig {
+            Some(old) if *old != sig => {
+                log::event(&format!("모니터 구성 변경 감지 ({}대 → {}대) — 재연결", old.len(), sig.len()));
+                self.shared.rebuild.store(true, Ordering::Relaxed);
+                self.monitor_sig = Some(sig);
+            }
+            None => self.monitor_sig = Some(sig),
+            _ => {}
         }
-        if needs_rebuild {
-            s.rebuild.store(true, Ordering::Relaxed);
+
+        if self.last_stats.elapsed() >= STATS_EVERY {
+            let s = &self.shared;
+            let now = [
+                s.frames_in.load(Ordering::Relaxed),
+                s.frames_published.load(Ordering::Relaxed),
+                s.presents.load(Ordering::Relaxed),
+                s.rebuilds.load(Ordering::Relaxed),
+            ];
+            let d: Vec<u64> = now.iter().zip(self.stats_base.iter()).map(|(a, b)| a - b).collect();
+            log::event(&format!(
+                "동작 중 · 최근 {}분: 수신 {} · 처리 {} · 표시 {} · 스트림 생성 {}",
+                STATS_EVERY.as_secs() / 60,
+                d[0],
+                d[1],
+                d[2],
+                d[3]
+            ));
+            self.stats_base = now;
+            self.last_stats = Instant::now();
         }
-        save_config(s);
-        self.update_title();
+    }
+
+    /// 공유 창 우클릭 → 메뉴 막대와 같은 메뉴를 띄운다
+    fn show_context_menu(&self) {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            let (Some(window), Some(m)) = (&self.window, &self.menu) else { return };
+            let Ok(handle) = window.window_handle() else { return };
+            match handle.as_raw() {
+                #[cfg(target_os = "windows")]
+                RawWindowHandle::Win32(h) => {
+                    use tray_icon::menu::ContextMenu;
+                    // Windows는 메뉴가 닫힐 때까지 여기서 기다린다(winit이 그동안의 이벤트를 보관)
+                    unsafe {
+                        m.menu.show_context_menu_for_hwnd(h.hwnd.get(), None);
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                RawWindowHandle::AppKit(h) => {
+                    // macOS는 메뉴가 열려 있는 동안 별도 루프가 돈다. winit 이벤트 처리 도중에
+                    // 띄우면 재진입 문제가 생기므로, 처리가 끝난 뒤 메인 큐에서 띄운다.
+                    let view = h.ns_view.as_ptr() as usize;
+                    CONTEXT_MENU.with(|c| *c.borrow_mut() = Some(m.menu.clone()));
+                    dispatch2::DispatchQueue::main().exec_async(move || {
+                        use tray_icon::menu::ContextMenu;
+                        CONTEXT_MENU.with(|c| {
+                            if let Some(menu) = c.borrow().as_ref() {
+                                unsafe {
+                                    menu.show_context_menu_for_nsview(view as *const std::ffi::c_void, None);
+                                }
+                            }
+                        });
+                    });
+                }
+                _ => {
+                    let _ = m;
+                }
+            }
+        }
     }
 }
 
-impl ApplicationHandler<()> for App {
+#[cfg(target_os = "macos")]
+thread_local! {
+    static CONTEXT_MENU: std::cell::RefCell<Option<tray_icon::menu::Menu>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// macOS: 공유 창의 시스템 창 번호(CGWindowID)를 얻는다 — 캡처 제외용
+#[cfg(target_os = "macos")]
+fn own_window_number(window: &Window) -> Option<u32> {
+    use objc2::runtime::AnyObject;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else { return None };
+    unsafe {
+        let view: &AnyObject = h.ns_view.cast::<AnyObject>().as_ref();
+        let win: *mut AnyObject = objc2::msg_send![view, window];
+        if win.is_null() {
+            return None;
+        }
+        let n: isize = objc2::msg_send![&*win, windowNumber];
+        (n > 0).then_some(n as u32)
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let attrs = Window::default_attributes()
@@ -733,10 +830,32 @@ impl ApplicationHandler<()> for App {
                 softbuffer::Context::new(window.clone()).expect("그래픽 컨텍스트 생성 실패");
             let surface =
                 softbuffer::Surface::new(&context, window.clone()).expect("표시 서피스 생성 실패");
+            #[cfg(target_os = "macos")]
+            if let Some(id) = own_window_number(&window) {
+                self.shared.own_window_id.store(id, Ordering::Relaxed);
+            }
             self.window = Some(window);
             self.surface = Some(surface);
-            self.update_title();
         }
+
+        // 메뉴 막대 아이콘·전역 단축키 — 이벤트 루프가 돌기 시작한 뒤에 만들어야 한다
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if self.menu.is_none() {
+            let proxy = Arc::new(Mutex::new(self.proxy.clone()));
+            let send = move |a: Action| {
+                if let Ok(p) = proxy.lock() {
+                    let _ = p.send_event(UserEvent::Action(a));
+                }
+            };
+            let m = menu::AppMenu::new(send);
+            if m.hotkey_ok {
+                log::event(&format!("전역 가림 단축키 등록됨 ({})", menu::HOTKEY_LABEL));
+            }
+            self.menu = Some(m);
+        }
+        self.update_title();
+        self.draw();
+
         // 창이 생긴 뒤에 캡처를 시작해야 자기 창 제외 목록에 이 창이 들어감
         if !self.capture_started {
             self.capture_started = true;
@@ -746,12 +865,29 @@ impl ApplicationHandler<()> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        self.update_title();
-        // request_redraw()에 맡기지 않고 즉시 그린다 — 창이 다른 창에 완전히
-        // 가려져 있을 때 macOS가 재그리기 요청을 미루거나 생략할 수 있는데,
-        // 그러면 디스코드가 캡처해 가는 이 창의 내용이 멈춘 것처럼 보인다.
-        self.draw();
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Wake => {
+                self.update_title();
+                // request_redraw()에 맡기지 않고 즉시 그린다 — 창이 다른 창에 완전히
+                // 가려져 있을 때 macOS가 재그리기 요청을 미루거나 생략할 수 있는데,
+                // 그러면 디스코드가 캡처해 가는 이 창의 내용이 멈춘 것처럼 보인다.
+                self.draw();
+            }
+            UserEvent::Action(a) => self.apply(a, event_loop),
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // 생존 신호: 새 프레임이 없어도 마지막 화면을 주기적으로 다시 내보낸다
+        if self.last_present.elapsed() >= KEEPALIVE {
+            self.draw();
+        }
+        if self.last_housekeep.elapsed() >= HOUSEKEEP {
+            self.housekeep(event_loop);
+        }
+        let next = std::cmp::min(self.last_present + KEEPALIVE, self.last_housekeep + HOUSEKEEP);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
 
     fn window_event(
@@ -762,8 +898,7 @@ impl ApplicationHandler<()> for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                self.shared.quit.store(true, Ordering::Relaxed);
-                save_config(&self.shared);
+                self.shutdown();
                 event_loop.exit();
             }
             WindowEvent::Resized(_) => {
@@ -772,9 +907,19 @@ impl ApplicationHandler<()> for App {
                 }
             }
             WindowEvent::RedrawRequested => self.draw(),
-            WindowEvent::KeyboardInput { event, .. } => self.on_key(event),
+            WindowEvent::KeyboardInput { event, .. } => self.on_key(event, event_loop),
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                self.show_context_menu();
+            }
+            WindowEvent::Occluded(hidden) => {
+                log::event(if hidden { "공유 창이 완전히 가려짐" } else { "공유 창이 다시 보임" });
+            }
             _ => {}
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.shutdown();
     }
 }
 
@@ -800,16 +945,24 @@ fn prevent_app_nap() {
 fn prevent_app_nap() {}
 
 fn main() {
+    log::init(log::default_dir());
     prevent_app_nap();
     let shared = Arc::new(Shared::new());
     load_config(&shared);
+    log::event(&format!(
+        "BlurScreen {APP_VERSION} 시작 ({}, 블러 {}, {}fps)",
+        std::env::consts::OS,
+        STRENGTHS[shared.strength.load(Ordering::Relaxed)].2,
+        FPS_OPTIONS[shared.fps_idx.load(Ordering::Relaxed)]
+    ));
 
-    let event_loop = EventLoop::<()>::with_user_event()
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("이벤트 루프 생성 실패");
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
+    let now = Instant::now();
     let mut app = App {
         shared,
         proxy,
@@ -817,6 +970,13 @@ fn main() {
         surface: None,
         capture_started: false,
         last_title: String::new(),
+        last_present: now,
+        last_housekeep: now,
+        last_stats: now,
+        stats_base: [0; 4],
+        monitor_sig: None,
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        menu: None,
     };
     let _ = event_loop.run_app(&mut app);
 }

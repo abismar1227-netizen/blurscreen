@@ -1,15 +1,23 @@
 [package]
 name = "blurscreen"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
 description = "Privacy blur window for screen sharing (Discord etc.)"
 
 [dependencies]
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 scap = "0.0.8"
 softbuffer = "0.4"
 winit = "0.30"
 
+# 메뉴 막대/트레이 메뉴와 전역 단축키 (macOS·Windows 전용)
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+global-hotkey = "0.8"
+tray-icon = "0.26"
+
 [target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = "0.3"
+objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSProcessInfo", "NSString"] }
 
 [profile.release]
